@@ -21,6 +21,7 @@
 #include "main.h"
 #include "can.h"
 #include "i2c.h"
+#include "stm32f4xx_hal.h"
 #include "usart.h"
 #include "gpio.h"
 #include <stdio.h>
@@ -39,6 +40,10 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
+#define DEBUG_UART_ENABLE      1U
+#define DEBUG_CAN_RX_VERBOSE   1U
+#define DEBUG_I2C_VERBOSE      1U
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -50,14 +55,14 @@
 
 /* USER CODE BEGIN PV */
 
-// MCP4728 默认 I2C 地址 (0x60 )
-#define MCP4728_ADDR (0x60 << 1) // 左移1位以适应 HAL 库的地址格式 (7位地址 + 1位读写)
+// MCP4728 默认 7-bit 地址为 0x60，HAL 发送时使用左移后的地址格式
+#define MCP4728_ADDR (0x60U << 1)
 
 // --- 4~20mA 映射用常数 ---
 // 假设硬件把 DAC (0~4095) 的输出电压(0~Vref)转换为 0~20mA
 // 所以 4mA 对应的 DAC 值为: (4mA/20mA) * 4095 ≈ 819，20mA对应 4095
 // (*如果您的硬件本身是将 0~Vref 转化为 4~20mA, 则此处应改为 0 和 4095)
-#define DAC_4MA_VAL  819
+#define DAC_4MA_VAL  0
 #define DAC_20MA_VAL 4095
 
 // 定义 CAN 接收到数据的对应量程
@@ -90,6 +95,7 @@ void SystemClock_Config(void);
 void MCP4728_Write_3Channels(uint16_t chA, uint16_t chB, uint16_t chC);
 static void CAN_Send_Loopback_TestFrame(void);
 static void Debug_Printf(const char *fmt, ...);
+static void Debug_PrintCanPayload(const CAN_RxHeaderTypeDef *rxHeader, const uint8_t *rxData);
 
 /* USER CODE END PFP */
 
@@ -98,6 +104,7 @@ static void Debug_Printf(const char *fmt, ...);
 
 static void Debug_Printf(const char *fmt, ...)
 {
+#if DEBUG_UART_ENABLE
   char buf[160];
   va_list args;
 
@@ -114,6 +121,23 @@ static void Debug_Printf(const char *fmt, ...)
   }
 
   (void)HAL_UART_Transmit(&huart2, (uint8_t *)buf, (uint16_t)len, 50U);
+#else
+  (void)fmt;
+#endif
+}
+
+static void Debug_PrintCanPayload(const CAN_RxHeaderTypeDef *rxHeader, const uint8_t *rxData)
+{
+#if DEBUG_UART_ENABLE && DEBUG_CAN_RX_VERBOSE
+  Debug_Printf("[CAN RX] ID=0x%03lX DLC=%lu DATA=%02X %02X %02X %02X %02X %02X %02X %02X\r\n",
+               rxHeader->StdId,
+               rxHeader->DLC,
+               rxData[0], rxData[1], rxData[2], rxData[3],
+               rxData[4], rxData[5], rxData[6], rxData[7]);
+#else
+  (void)rxHeader;
+  (void)rxData;
+#endif
 }
 
 /* USER CODE END 0 */
@@ -178,7 +202,14 @@ int main(void)
       Error_Handler();
   }
 
-  Debug_Printf("[BOOT] CAN+I2C debug enabled\r\n");
+  Debug_Printf("[I2C SCAN] Scanning 0x01~0x7F...\r\n");
+    for (uint8_t addr = 0x01; addr <= 0x7F; addr++) {
+      HAL_StatusTypeDef ret = HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)(addr << 1), 2, 10);
+      if (ret == HAL_OK) {
+          Debug_Printf("[I2C SCAN] addr=0x%02X -> ACK <<<\r\n", addr);
+      }
+  }
+  Debug_Printf("[I2C SCAN] Done\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -275,7 +306,7 @@ static void CAN_Send_Loopback_TestFrame(void) {
   }
   lastTickMs = HAL_GetTick();
 
-  /* 固定阶梯测试值：A=0、B=5000、C=10000 -> 理论 4mA/12mA/20mA */
+  /* 固定阶梯测试值：A=0、B=5000、C=10000 -> 理论 20mA/12mA/4mA */
   const uint32_t a = 10000U;
   const uint16_t b = 5000U;
   const uint16_t c = 0U;
@@ -331,6 +362,7 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
   if ((hcan->Instance == CAN1) && (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rxHeader, rxData) == HAL_OK)) {
     if ((rxHeader.StdId == 0x181U) && (rxHeader.DLC >= 8U)) {
             g_can_rx_ok++;
+            Debug_PrintCanPayload(&rxHeader, rxData);
             // 将 16 进制存储格式转换为 10 进制整型变量的值
             // 通道A: 前4个字节组成32位整型变量
             int32_t rawA = (int32_t)(((uint32_t)rxData[0] << 24) | ((uint32_t)rxData[1] << 16) | ((uint32_t)rxData[2] << 8) | rxData[3]);
@@ -346,6 +378,16 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
             uint16_t valB = Map_To_4_20mA(rawB);
             uint16_t valC = Map_To_4_20mA(rawC);
 
+#if DEBUG_UART_ENABLE && DEBUG_CAN_RX_VERBOSE
+            Debug_Printf("[MAP] RAW A=%ld B=%ld C=%ld -> DAC A=%u B=%u C=%u\r\n",
+                         (long)rawA,
+                         (long)rawB,
+                         (long)rawC,
+                         valA,
+                         valB,
+                         valC);
+#endif
+
       dac_chA_pending = valA;
       dac_chB_pending = valB;
       dac_chC_pending = valC;
@@ -358,42 +400,61 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
 }
 
 /**
-  * @brief 向 MCP4728 发送 I2C 指令 (Multi-Write 连续写入模式)
+  * @brief 向 MCP4728 发送 I2C 指令 (Sequential Write 模式，从 Ch.A 顺序写三通道)
+  *
+  * 帧格式 (datasheet §5.6.2 Sequential Write):
+  *   Byte 0: 0x50  = 0101_0000  命令字，从 Ch.A 开始顺序写
+  *   Byte 1: 0x90 | (D11~D8)   Ch.A 高字节: bit7=1, VRef=VDD(0), PD=Normal(00), Gain=x1(0), D11-8
+  *   Byte 2: D7~D0             Ch.A 低字节
+  *   Byte 3: 0x90 | (D11~D8)   Ch.B 高字节 (同上)
+  *   Byte 4: D7~D0             Ch.B 低字节
+  *   Byte 5: 0x90 | (D11~D8)   Ch.C 高字节 (同上)
+  *   Byte 6: D7~D0             Ch.C 低字节
+  *
+  *   0x90 = 1001_0000
+  *          ││││└─── Gain  = x1
+  *          │││└──── PD0   = Normal
+  *          ││└───── PD1   = Normal
+  *          │└────── VRef  = VDD (使用 VDD 为参考电压)
+  *          └─────── 高字节标志 (固定为 1)
+  *
+  * LDAC 时序: 先完成 I2C 传输，再给低脉冲触发三通道同步更新输出。
   */
 void MCP4728_Write_3Channels(uint16_t chA, uint16_t chB, uint16_t chC) {
-    // 1个命令字节 + 3个通道 * 2字节(高低) = 7字节
+    // 1个命令字节 + 3个通道 × 2字节 = 7字节
     uint8_t data[7];
-
-    // 写入前保持 LDAC 为高，防止通道在传输过程中提前更新
-    HAL_GPIO_WritePin(MCP4728_LDAC_GPIO_Port, MCP4728_LDAC_Pin, GPIO_PIN_SET);
-
-    // 字节 0: Multi-Write 命令
-    // 格式: 0100 0 DAC1 DAC0 UD
-    // 0x40 = 0100 0000 -> 从通道A开始写入，UD=0 (立即更新)
-    // 0x41 = 0100 0001 -> 从通道A开始写入，UD=1 (挂起，等待 LDAC 引脚的低脉冲才更新)
-    data[0] = 0x41; 
-
-    // 通道 A: 高字节 (Vref=VDD, PD=Normal, Gain=1) 和 低字节
-    data[1] = (chA >> 8) & 0x0F; 
-    data[2] = chA & 0xFF;
-    
-    // 通道 B: 高字节和低字节
-    data[3] = (chB >> 8) & 0x0F; 
-    data[4] = chB & 0xFF;
-
-    // 通道 C: 高字节和低字节
-    data[5] = (chC >> 8) & 0x0F; 
-    data[6] = chC & 0xFF;
-
-    // 发送 7 个字节
+ 
+    // Byte 0: Sequential Write 命令，从 Ch.A 开始
+    data[0] = 0x50;
+ 
+    // Byte 1~2: 通道 A
+    data[1] = 0x90 | ((chA >> 8) & 0x0F);  // 高字节: 控制位 + D11~D8
+    data[2] = chA & 0xFF;                   // 低字节: D7~D0
+ 
+    // Byte 3~4: 通道 B
+    data[3] = 0x90 | ((chB >> 8) & 0x0F);  // 高字节: 控制位 + D11~D8
+    data[4] = chB & 0xFF;                   // 低字节: D7~D0
+ 
+    // Byte 5~6: 通道 C
+    data[5] = 0x90 | ((chC >> 8) & 0x0F);  // 高字节: 控制位 + D11~D8
+    data[6] = chC & 0xFF;                   // 低字节: D7~D0
+ 
+#if DEBUG_UART_ENABLE && DEBUG_I2C_VERBOSE
+    Debug_Printf("[I2C TX] MCP4728 data=%02X %02X %02X %02X %02X %02X %02X\r\n",
+                 data[0], data[1], data[2], data[3], data[4], data[5], data[6]);
+#endif
+ 
+    // 先完成 I2C 传输，再触发 LDAC 低脉冲使三通道同步更新
     if (HAL_I2C_Master_Transmit(&hi2c1, MCP4728_ADDR, data, 7, 50) == HAL_OK) {
-    g_i2c_tx_ok++;
-        // 给 LDAC 一个低脉冲，使 A/B/C 寄存器同步推送到物理输出引脚
-        HAL_GPIO_WritePin(MCP4728_LDAC_GPIO_Port, MCP4728_LDAC_Pin, GPIO_PIN_RESET);
-        // 恢复高电平
-        HAL_GPIO_WritePin(MCP4728_LDAC_GPIO_Port, MCP4728_LDAC_Pin, GPIO_PIN_SET);
-  } else {
-    g_i2c_tx_fail++;
+      g_i2c_tx_ok++;
+      // LDAC 低脉冲：将 A/B/C 输入寄存器同步推送到物理输出引脚
+      HAL_GPIO_WritePin(MCP4728_LDAC_GPIO_Port, MCP4728_LDAC_Pin, GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(MCP4728_LDAC_GPIO_Port, MCP4728_LDAC_Pin, GPIO_PIN_SET);
+    } else {
+      g_i2c_tx_fail++;
+#if DEBUG_UART_ENABLE
+      Debug_Printf("[I2C ERR] HAL_I2C_Master_Transmit failed, err=0x%08lX\r\n", (unsigned long)HAL_I2C_GetError(&hi2c1));
+#endif
     }
 }
 /* USER CODE END 4 */
